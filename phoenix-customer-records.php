@@ -3,7 +3,7 @@
  * Plugin Name:       Phoenix Nest Customer Records
  * Plugin URI:        https://github.com/codebyshoaib
  * Description:       One read-only admin screen set: search and filter customers, open one, and see every rental with its renter details, signed agreement, uploaded documents, and pickup/return condition photos. Writes no booking data.
- * Version:           1.3.0
+ * Version:           1.4.0
  * Author:            Shoaib Ud Din
  * Author URI:        https://www.linkedin.com/in/shoaibbb/
  * Requires PHP:      7.4
@@ -35,7 +35,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'PN_CR_VERSION', '1.3.0' );
+define( 'PN_CR_VERSION', '1.4.0' );
 define( 'PN_CR_SLUG', 'pn-customer-records' );
 
 /* ===================================================================
@@ -148,7 +148,7 @@ function pn_cr_customer( $key, $booking_ids ) {
 	$name = $phone = '';
 	$spend = 0.0;
 	$pickups = array();
-	$complete = 0;
+	$filed = 0;
 	$pending = 0;
 	$pending_at = '';
 	$pending_phase = '';
@@ -161,10 +161,17 @@ function pn_cr_customer( $key, $booking_ids ) {
 		$pickup = pn_cr_ymd( pn_cr_meta( $id, '_phoenix_pickup_datetime' ) );
 		if ( $pickup ) { $pickups[] = $pickup; }
 
-		// "Complete" means a usable before/after PAIR. A pickup set with no return set is not
-		// evidence of anything, so it does not count.
+		// COUNT SETS, TWO PER RENTAL — pickup and return each count on their own.
+		//
+		// This used to count complete before/after PAIRS, on the reasoning that a lone pickup set
+		// proves nothing in a dispute. True, and it still reads that way on the rental card's
+		// complete/incomplete pill — but as the number on a list it lied by omission: booking #955 had
+		// six pickup photos on file and the column said "0 of 1", which reads as "no photos" and is the
+		// one thing the owner must not be told when he is deciding who to chase.
+		foreach ( array( 'pickup', 'return' ) as $p ) {
+			if ( '' !== pn_cr_meta( $id, '_pn_vc_' . $p . '_done_at' ) ) { $filed++; }
+		}
 		$phase = pn_cr_photo_phase( $id );
-		if ( 'done' === $phase ) { $complete++; }
 
 		// WHICH rental the list-row button chases when a customer has several: the one that is still
 		// open and has the LATEST pickup, i.e. the rental in play. `>` not `>=`, so bookings the query
@@ -190,7 +197,9 @@ function pn_cr_customer( $key, $booking_ids ) {
 		'first'    => $pickups ? $pickups[0] : '',
 		'last'     => $pickups ? end( $pickups ) : '',
 		'pickups'  => $pickups,
-		'complete' => $complete,
+		// Photo sets: how many are filed, out of two per rental.
+		'filed'    => $filed,
+		'sets'     => 2 * count( $booking_ids ),
 		// The rental to chase for photos, and for which phase. 0 / '' when every set is filed.
 		'pending'       => $pending,
 		'pending_phase' => $pending_phase,
@@ -646,11 +655,12 @@ function pn_cr_render_list() {
 	}
 
 	// Totals describe what is ON SCREEN, so they stay meaningful once a filter is applied.
-	$rentals = 0; $revenue = 0.0; $pairs = 0;
+	$rentals = 0; $revenue = 0.0; $filed = 0; $sets = 0;
 	foreach ( $rows as $c ) {
 		$rentals += (int) $c['rentals'];
 		$revenue += (float) $c['spend'];
-		$pairs   += (int) $c['complete'];
+		$filed   += (int) $c['filed'];
+		$sets    += (int) $c['sets'];
 	}
 	?>
 	<div class="pn-cr-head">
@@ -665,7 +675,7 @@ function pn_cr_render_list() {
 			$filtered ? 'of ' . number_format_i18n( count( $all ) ) : '' );
 		pn_cr_stat( 'Rentals', number_format_i18n( $rentals ) );
 		pn_cr_stat( 'Revenue', '$' . number_format( $revenue, 2 ) );
-		pn_cr_stat( 'Photo pairs', $pairs . ' / ' . $rentals, 'pickup + return both filed' );
+		pn_cr_stat( 'Photo sets', $filed . ' / ' . $sets, 'pickup + return, one each per rental' );
 		?>
 	</div>
 
@@ -734,7 +744,8 @@ function pn_cr_render_list() {
 			$link       = add_query_arg( array( 'page' => 'pn-customer-records', 'customer' => $c['id'] ), admin_url( 'admin.php' ) );
 			$unassigned = pn_cr_unassigned_key() === $c['key'];
 			$name       = $unassigned ? 'Unassigned bookings' : ( $c['name'] ?: '(no name recorded)' );
-			$done       = (int) $c['complete'];
+			$filed      = (int) $c['filed'];
+			$sets       = (int) $c['sets'];
 			$total      = (int) $c['rentals'];
 			?>
 			<tr<?php echo $unassigned ? ' class="pn-cr-unassigned"' : ''; ?>>
@@ -765,18 +776,20 @@ function pn_cr_render_list() {
 				<td><?php echo esc_html( pn_cr_fmt_day( $c['first'] ) ?: '—' ); ?></td>
 				<td><?php echo esc_html( pn_cr_fmt_day( $c['last'] ) ?: '—' ); ?></td>
 				<td><div class="pn-cr-photocell"><?php
-					// The button first: a row that reads "0 of 1" is a row the owner wants to act on, and
-					// making him open the customer to do it is the step this saves. It targets the rental
+					// The button first: a row with a set still missing is a row the owner wants to act on,
+					// and making him open the customer to do it is the step this saves. It targets the rental
 					// still in play (pn_cr_customer), so a customer with history nudges the current rental.
 					pn_cr_render_nudge( $c['pending'], $c['pending_phase'] );
 
 					// Neutral until it is actually complete: every row reading red is noise, not a signal.
-					$cls = ( $total && $done === $total ) ? 'is-ok' : ( $done ? 'is-part' : 'is-none' );
+					// The unit is NAMED. "0 of 1" was read as a photo count, which is the one thing this
+					// number is not — see pn_cr_customer().
+					$cls = ( $sets && $filed === $sets ) ? 'is-ok' : ( $filed ? 'is-part' : 'is-none' );
 					printf(
-						'<span class="pn-cr-pairs %s"><span class="pn-cr-bar"><i style="width:%d%%"></i></span>%d of %d</span>',
+						'<span class="pn-cr-pairs %s"><span class="pn-cr-bar"><i style="width:%d%%"></i></span>%d of %d sets</span>',
 						esc_attr( $cls ),
-						$total ? (int) round( 100 * $done / $total ) : 0,
-						$done, $total
+						$sets ? (int) round( 100 * $filed / $sets ) : 0,
+						$filed, $sets
 					);
 				?></div></td>
 				<td class="pn-cr-num pn-cr-money"><?php echo esc_html( '$' . number_format( $c['spend'], 2 ) ); ?></td>
@@ -837,7 +850,7 @@ function pn_cr_render_detail( $who ) {
 		<?php
 		pn_cr_stat( 'Rentals', number_format_i18n( $match['rentals'] ) );
 		pn_cr_stat( 'Total spend', '$' . number_format( $match['spend'], 2 ) );
-		pn_cr_stat( 'Photo pairs', $match['complete'] . ' / ' . $match['rentals'], 'pickup + return both filed' );
+		pn_cr_stat( 'Photo sets', $match['filed'] . ' / ' . $match['sets'], 'pickup + return, one each per rental' );
 		pn_cr_stat( 'First rental', pn_cr_fmt_day( $match['first'] ) ?: '—' );
 		pn_cr_stat( 'Last rental', pn_cr_fmt_day( $match['last'] ) ?: '—' );
 		?>

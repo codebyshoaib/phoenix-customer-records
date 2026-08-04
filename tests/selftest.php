@@ -136,7 +136,16 @@ is_( $mike['phone'], '555-0100', 'phone is taken from whichever booking recorded
 is_( $mike['spend'], 1750.0, 'spend sums mpbc_price across rentals' );
 is_( $mike['first'], '2026-03-10', 'first rental is the earliest pickup, not the first row' );
 is_( $mike['last'], '2026-05-02', 'last rental is the latest pickup' );
-is_( $mike['complete'], 1, 'only a pickup+return PAIR counts as a complete photo set' );
+
+/* PHOTO SETS, TWO PER RENTAL — pickup and return counted separately. Booking 11 filed both, 12 filed
+ * pickup only, so 3 of 4. The old measure counted complete PAIRS and reported 1 of 2, which on the
+ * list read "0 of 1" for a rental with six pickup photos on file — a number that says "no photos"
+ * about the exact rental the owner is deciding whether to chase. */
+is_( $mike['filed'], 3, 'a lone pickup set counts as one filed set, not as nothing' );
+is_( $mike['sets'], 4, 'two sets per rental is the denominator' );
+is_( pn_cr_customer( 'x', array( 11 ) )['filed'], 2, 'a rental with both sets filed counts both' );
+is_( pn_cr_customer( 'x', array( 13 ) )['filed'], 0, 'and a rental with neither counts nothing' );
+is_( pn_cr_customer( 'x', array( 13 ) )['sets'], 2, 'while still being out of two' );
 is_( $mike['id'], md5( 'mike@example.com' ), 'detail links key on a hash, so no email lands in a URL' );
 
 $unassigned = pn_cr_customer( '__unassigned', array( 14 ) );

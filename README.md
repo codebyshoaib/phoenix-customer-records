@@ -58,7 +58,9 @@ There is **no taxonomy, no backfill, and no `save_post` hook.** Grouping is a si
 
 ### Screens
 
-**Customer list** — a stat strip (customers, rentals, revenue, photo pairs) that describes *what's on screen* so it stays meaningful under a filter; then the table: initials avatar, stacked contact cell, rentals, first/last rental, condition-photo completeness as a progress bar, and total spend.
+**Customer list** — a stat strip (customers, rentals, revenue, photo sets) that describes *what's on screen* so it stays meaningful under a filter; then the table: initials avatar, stacked contact cell, rentals, first/last rental, condition-photo completeness as a progress bar, and total spend.
+
+> **Photo sets, two per rental — and the unit is named (v1.4.0).** This counted complete before/after *pairs*, on the sound reasoning that a lone pickup set proves nothing in a dispute. As a number on a list it still lied: a rental with six pickup photos on file read **“0 of 1”**, which scans as *no photos* about the exact rental you are deciding whether to chase. Pickup and return now count separately — `1 of 2 sets` — so the bar moves when the first half lands, and the fraction says what it is counting. The all-or-nothing reading survives where it belongs: the rental card's *Photos complete / incomplete* pill.
 
 Filters are free-text (name / email / phone) and a rental **date range** — the range matches customers having *any* rental in the window, because "did this person rent in March" is the question actually being asked.
 
