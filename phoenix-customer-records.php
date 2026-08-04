@@ -3,7 +3,7 @@
  * Plugin Name:       Phoenix Nest Customer Records
  * Plugin URI:        https://github.com/codebyshoaib
  * Description:       One read-only admin screen set: search and filter customers, open one, and see every rental with its renter details, signed agreement, uploaded documents, and pickup/return condition photos. Writes no booking data.
- * Version:           1.1.0
+ * Version:           1.2.0
  * Author:            Shoaib Ud Din
  * Author URI:        https://www.linkedin.com/in/shoaibbb/
  * Requires PHP:      7.4
@@ -28,7 +28,8 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'PN_CR_VERSION', '1.1.0' );
+define( 'PN_CR_VERSION', '1.2.0' );
+define( 'PN_CR_SLUG', 'pn-customer-records' );
 
 /* ===================================================================
  * 1. Capability
@@ -253,12 +254,22 @@ function pn_cr_thumb( $att_id, $label = '' ) {
 /**
  * The signed agreement link, from `_pn_esign_doc_id` (written by the bridge from v1.1.0).
  *
- * Only the login-gated PDF route is rendered. WP E-Signature also exposes a public
- * `document_uri` (`?page_id=…&docid=…&csum=…`) that needs no login, and the architecture map's
- * standing rule is that this link is a bearer token which must never be put in a page, log, or
- * ticket — so printing it into an admin screen (where it lands in browser history and any
- * screenshot) is exactly what that rule forbids. The spec's §5.2 "render two links" predates that
- * rule; the rule wins. The admin reading this screen is logged in, so the PDF route works for them.
+ * The architecture map's standing rule is that E-Signature's PDF URL is a bearer token which must
+ * never be put in a page, log, or ticket — printing it into an admin screen (where it lands in
+ * browser history and every screenshot) is exactly what that rule forbids. The spec's §5.2 "render
+ * two links" predates that rule; the rule wins.
+ *
+ * v1.2.0: this used to link `admin.php?page=esigpdf&did=…`, believing that to be a login-gated
+ * equivalent. **There is no login-gated route.** E-Signature 2.1.3 ships that admin page but has
+ * its registration COMMENTED OUT (`esig-save-as-pdf/admin/esig-pdf-admin.php:38`), so the slug is
+ * not in `$_registered_pages` and `admin.php` answers every request with "Sorry, you are not
+ * allowed to access this page." — a hard 403 for admins included. The only route the vendor
+ * actually ships is the front-end `?esigtodo=esigpdf&did=…` on `default_link()`, and that one is
+ * fully public: an anonymous request with no cookies returns the signed PDF.
+ *
+ * So we keep the rule AND make the button work: link our own capability-checked handler
+ * (`pn_cr_maybe_stream_pdf`) and let it fetch the bearer URL server-side. The token never reaches
+ * the browser.
  */
 function pn_cr_agreement( $booking_id ) {
 	$doc_id = (int) pn_cr_meta( $booking_id, '_pn_esign_doc_id' );
@@ -285,8 +296,86 @@ function pn_cr_agreement( $booking_id ) {
 	return array(
 		'state'  => 'ok',
 		'doc_id' => $doc_id,
-		'url'    => admin_url( 'admin.php?page=esigpdf&did=' . rawurlencode( $csum ) ),
+		'csum'   => $csum,
+		// Our own gated route, not E-Signature's. Nonce is per-booking so a leaked link from one
+		// rental cannot be edited into another.
+		'url'    => wp_nonce_url(
+			admin_url( 'admin.php?page=' . PN_CR_SLUG . '&pn_cr_pdf=' . $doc_id ),
+			'pn_cr_pdf_' . $doc_id
+		),
 	);
+}
+
+/**
+ * The vendor's own construction for the PDF URL, copied from
+ * `esig-save-as-pdf/admin/esig-pdf-admin.php` (lines 69 / 142 / 166) rather than invented here, so
+ * the document page is whatever E-Signature is configured to use — never a hardcoded slug.
+ */
+function pn_cr_esig_pdf_url( $csum ) {
+	if ( ! function_exists( 'WP_E_Sig' ) ) { return ''; }
+	$esig = WP_E_Sig();
+	if ( ! isset( $esig->setting ) || ! method_exists( $esig->setting, 'default_link' ) ) { return ''; }
+	$base = (string) $esig->setting->default_link();
+	if ( '' === $base ) { return ''; }
+	return add_query_arg( array( 'esigtodo' => 'esigpdf', 'did' => $csum ), $base );
+}
+
+/**
+ * Stream the signed PDF behind this plugin's own capability check.
+ *
+ * Why proxy at all, rather than just linking E-Signature's URL: that URL is a bearer token (see
+ * pn_cr_agreement). Fetching it server-side keeps it out of browser history, the address bar, and
+ * screenshots of this screen, which is the whole point of the rule. A 302 would defeat that — the
+ * token would land in the address bar — so the bytes are passed through instead.
+ *
+ * Runs on admin_init, before any output, and always exits.
+ */
+add_action( 'admin_init', 'pn_cr_maybe_stream_pdf' );
+function pn_cr_maybe_stream_pdf() {
+	if ( ! isset( $_GET['pn_cr_pdf'] ) ) { return; }
+	$doc_id = absint( $_GET['pn_cr_pdf'] );
+	if ( ! $doc_id ) { return; }
+
+	if ( ! current_user_can( pn_cr_cap() ) ) {
+		wp_die( esc_html__( 'You do not have permission to view signed agreements.' ), '', array( 'response' => 403 ) );
+	}
+	// wp_die()s on failure, which is the behaviour we want for a hand-edited link.
+	check_admin_referer( 'pn_cr_pdf_' . $doc_id );
+
+	// Re-resolve the checksum here; never trust one off the query string.
+	$csum = '';
+	try {
+		$esig = function_exists( 'WP_E_Sig' ) ? WP_E_Sig() : null;
+		if ( $esig && isset( $esig->document ) && method_exists( $esig->document, 'document_checksum_by_id' ) ) {
+			$csum = (string) $esig->document->document_checksum_by_id( $doc_id );
+		}
+	} catch ( Throwable $e ) {
+		$csum = '';
+	}
+	$url = ( '' !== $csum ) ? pn_cr_esig_pdf_url( $csum ) : '';
+	if ( '' === $url ) {
+		wp_die( esc_html__( 'That signed agreement could not be located in WP E-Signature. It may have been trashed.' ), '', array( 'response' => 404 ) );
+	}
+
+	$res = wp_remote_get( $url, array( 'timeout' => 30, 'redirection' => 3 ) );
+	if ( is_wp_error( $res ) || 200 !== (int) wp_remote_retrieve_response_code( $res ) ) {
+		wp_die( esc_html__( 'WP E-Signature did not return the signed PDF. Open it from E-Signature → Signed instead.' ), '', array( 'response' => 502 ) );
+	}
+	$body = wp_remote_retrieve_body( $res );
+	$type = (string) wp_remote_retrieve_header( $res, 'content-type' );
+	// If E-Signature answered with HTML it is an error page, not a document — don't hand that to the
+	// browser as a download.
+	if ( '' === $body || false === stripos( $type, 'pdf' ) ) {
+		wp_die( esc_html__( 'WP E-Signature returned an error page instead of the PDF. Open it from E-Signature → Signed instead.' ), '', array( 'response' => 502 ) );
+	}
+
+	nocache_headers();
+	header( 'Content-Type: application/pdf' );
+	header( 'Content-Length: ' . strlen( $body ) );
+	header( 'Content-Disposition: inline; filename="signed-rental-agreement-' . $doc_id . '.pdf"' );
+	header( 'X-Content-Type-Options: nosniff' );
+	echo $body; // phpcs:ignore WordPress.Security.EscapeOutput -- raw PDF bytes.
+	exit;
 }
 
 /** Reserved vehicle, as a name where possible. */
