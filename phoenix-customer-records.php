@@ -3,7 +3,7 @@
  * Plugin Name:       Phoenix Nest Customer Records
  * Plugin URI:        https://github.com/codebyshoaib
  * Description:       One read-only admin screen set: search and filter customers, open one, and see every rental with its renter details, signed agreement, uploaded documents, and pickup/return condition photos. Writes no booking data.
- * Version:           1.2.0
+ * Version:           1.3.0
  * Author:            Shoaib Ud Din
  * Author URI:        https://www.linkedin.com/in/shoaibbb/
  * Requires PHP:      7.4
@@ -18,6 +18,13 @@
  * them: deactivate any of the three and the matching block here simply renders "none", while a
  * fatal in here can only ever kill this one admin screen.
  *
+ * ONE CONTROL ON THESE SCREENS CHANGES STATE, and it is still not a write from here: the "Send …
+ * photo link" button (v1.3.0) is a form POST to vehicle-condition's OWN `pn_vc_nudge` endpoint,
+ * which mints the token, sends the mail and stamps the `_pn_vc_nudged_*` keys it owns. This file
+ * contributes markup and a `back` URL. The endpoint is the only contract between the two plugins —
+ * no function is called across the boundary, and the button hides itself when that endpoint is not
+ * registered, so deactivating vehicle-condition leaves a screen that reads, not one that 404s.
+ *
  * TWO TRAPS THIS SITE HAS ALREADY SPRUNG ONCE (docs/engineering-learnings.md §1, §9a):
  *   - No top-level `function_exists()` guard. PHP hoists function declarations, so such a guard is
  *     always true and the file returns before registering a single hook — silently.
@@ -28,7 +35,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'PN_CR_VERSION', '1.2.0' );
+define( 'PN_CR_VERSION', '1.3.0' );
 define( 'PN_CR_SLUG', 'pn-customer-records' );
 
 /* ===================================================================
@@ -119,6 +126,21 @@ function pn_cr_ymd( $datetime ) {
 }
 
 /**
+ * Which photo set this rental is still waiting on — `pickup`, `return`, or `done`.
+ *
+ * A DELIBERATE DUPLICATE of vehicle-condition's pn_vc_phase(), derived from the same two lock keys
+ * this file already reads, because that plugin's functions are not a dependency this one takes (see
+ * the header). The duplication is safe in the direction that matters: the send endpoint derives the
+ * phase again from the same meta and ignores anything the request says, so a drift here can only
+ * mislabel a button — it can never file return photos over a pickup set.
+ */
+function pn_cr_photo_phase( $booking_id ) {
+	if ( '' === pn_cr_meta( $booking_id, '_pn_vc_pickup_done_at' ) ) { return 'pickup'; }
+	if ( '' === pn_cr_meta( $booking_id, '_pn_vc_return_done_at' ) ) { return 'return'; }
+	return 'done';
+}
+
+/**
  * Everything the list screen shows for one customer, plus what the search and date filters need.
  * Deliberately pure enough to self-test: it reads meta and returns an array, nothing else.
  */
@@ -127,6 +149,9 @@ function pn_cr_customer( $key, $booking_ids ) {
 	$spend = 0.0;
 	$pickups = array();
 	$complete = 0;
+	$pending = 0;
+	$pending_at = '';
+	$pending_phase = '';
 
 	foreach ( $booking_ids as $id ) {
 		if ( '' === $name )  { $name  = pn_cr_customer_field( $id, 'name' ); }
@@ -138,8 +163,17 @@ function pn_cr_customer( $key, $booking_ids ) {
 
 		// "Complete" means a usable before/after PAIR. A pickup set with no return set is not
 		// evidence of anything, so it does not count.
-		if ( pn_cr_meta( $id, '_pn_vc_pickup_done_at' ) && pn_cr_meta( $id, '_pn_vc_return_done_at' ) ) {
-			$complete++;
+		$phase = pn_cr_photo_phase( $id );
+		if ( 'done' === $phase ) { $complete++; }
+
+		// WHICH rental the list-row button chases when a customer has several: the one that is still
+		// open and has the LATEST pickup, i.e. the rental in play. `>` not `>=`, so bookings the query
+		// already ordered newest-first win their own ties, and an undated booking ('') loses to any
+		// dated one rather than to whatever happened to be read last.
+		if ( 'done' !== $phase && ( 0 === $pending || $pickup > $pending_at ) ) {
+			$pending       = (int) $id;
+			$pending_at    = $pickup;
+			$pending_phase = $phase;
 		}
 	}
 	sort( $pickups );
@@ -157,6 +191,9 @@ function pn_cr_customer( $key, $booking_ids ) {
 		'last'     => $pickups ? end( $pickups ) : '',
 		'pickups'  => $pickups,
 		'complete' => $complete,
+		// The rental to chase for photos, and for which phase. 0 / '' when every set is filed.
+		'pending'       => $pending,
+		'pending_phase' => $pending_phase,
 	);
 }
 
@@ -437,6 +474,112 @@ function pn_cr_fmt( $mysql ) {
 }
 
 /* ===================================================================
+ * 3b. Chasing the missing photos — the only state-changing control here
+ *
+ * The screens above answer "are the photos there?" and, until v1.3.0, left the owner to go and find
+ * the day board to do anything about it. That is the wrong place to be sent from: the rental he is
+ * looking at is often not today's, and the board is reached by a bookmark on his phone. So the
+ * button lives where the gap is visible.
+ *
+ * IT SENDS NOTHING ITSELF. It posts to vehicle-condition's `pn_vc_nudge`, which owns the token, the
+ * mail and the `_pn_vc_nudged_*` keys. Two contracts cross the plugin boundary and both are
+ * deliberate and narrow: the endpoint's action + nonce name, and the outcome vocabulary those keys
+ * store ('sent' / 'noemail' / 'nosmtp' / 'failed'). Neither is a function call.
+ * =================================================================== */
+
+/** The label, or '' when there is nothing to send. Same strings as the board — see pn_cr_photo_phase. */
+function pn_cr_nudge_label( $phase ) {
+	if ( 'pickup' === $phase ) { return 'Send pickup photo link'; }
+	if ( 'return' === $phase ) { return 'Send return photo link'; }
+	return '';
+}
+
+/**
+ * This screen, as an absolute URL, so the endpoint can put the owner back on the row he tapped.
+ *
+ * Rebuilt from sanitized params, never from REQUEST_URI: the value is echoed into the page and then
+ * handed to a redirect on the other side, and neither is a place to put a raw request string.
+ * rawurlencode is required, not decoration — add_query_arg() inserts values UNENCODED, and
+ * wp_sanitize_redirect() then deletes the spaces, so a two-word search came back matching nothing
+ * (the identical trap vehicle-condition documents on its own redirect).
+ */
+function pn_cr_self_url() {
+	$args = array( 'page' => PN_CR_SLUG );
+	foreach ( array( 'customer', 's', 'from', 'to' ) as $k ) {
+		$v = isset( $_GET[ $k ] ) && is_scalar( $_GET[ $k ] )
+			? sanitize_text_field( (string) wp_unslash( $_GET[ $k ] ) ) : '';
+		if ( '' !== $v ) { $args[ $k ] = rawurlencode( $v ); }
+	}
+	return add_query_arg( $args, admin_url( 'admin.php' ) );
+}
+
+/**
+ * "Already sent" / "didn't go", read from stored meta for THIS phase. '' when nobody has sent one.
+ *
+ * Two jobs, and the second is why it is not decoration: it stops a double-send, and it refuses to
+ * call a message delivered when it wasn't. wp_mail() returning true means a transport accepted the
+ * message — with no SMTP on this host that transport is PHP mail(), which WP Engine discards. The
+ * sending plugin already draws that distinction; repeating "sent" here for anything other than the
+ * `sent` outcome would undo it, and the owner would stop chasing a renter he never reached.
+ */
+function pn_cr_nudge_note( $booking_id, $phase ) {
+	$at = pn_cr_meta( $booking_id, '_pn_vc_nudged_' . $phase . '_at' );
+	if ( '' === $at ) { return ''; }
+
+	$result = pn_cr_meta( $booking_id, '_pn_vc_nudged_' . $phase . '_r' );
+	if ( 'sent' === $result ) {
+		return '<span class="pn-cr-ok">&#10003; link sent ' . esc_html( pn_cr_fmt( $at ) ) . '</span>';
+	}
+	$why = array(
+		'noemail' => 'the booking has no usable email',
+		'nosmtp'  => 'this site has no SMTP yet, so nothing was delivered',
+		'failed'  => 'the mail server refused it',
+	);
+	return '<span class="pn-cr-todo">&#10007; not sent — '
+		. esc_html( isset( $why[ $result ] ) ? $why[ $result ] : 'the last attempt did not complete' )
+		. '</span>';
+}
+
+/**
+ * The button, plus whatever the last attempt did. Renders nothing when there is nothing to chase.
+ *
+ * The presence probe is has_action(), not function_exists() on some helper: what this screen depends
+ * on is the ENDPOINT. With vehicle-condition deactivated, admin-post.php answers an unhooked action
+ * with a blank page, so the button has to disappear rather than look live.
+ *
+ * No `k` field, unlike the board's copy of this form: an admin who can reach this screen already
+ * satisfies pn_vc_is_owner() through its manage_options branch, and printing the owner's bookmark
+ * secret into wp-admin would leak it into every screenshot of this page to buy nothing.
+ */
+function pn_cr_render_nudge( $booking_id, $phase ) {
+	$booking_id = (int) $booking_id;
+	$label      = pn_cr_nudge_label( $phase );
+	if ( ! $booking_id || '' === $label || ! has_action( 'admin_post_pn_vc_nudge' ) ) { return; }
+
+	$email = pn_cr_customer_field( $booking_id, 'email' );
+	if ( ! is_email( $email ) ) {
+		echo '<span class="pn-cr-todo">No usable email on booking #' . (int) $booking_id
+			. ' — add one, or use the QR on the day board.</span>';
+		return;
+	}
+	// Names the booking and the address: on a customer with several rentals the row-level button has
+	// to say which one it is about, and the owner wants to see the address before he sends to it.
+	$title = sprintf( 'Emails the %s photo link for booking #%d to %s', $phase, $booking_id, $email );
+	?>
+	<form class="pn-cr-nudge" method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+		<input type="hidden" name="action" value="pn_vc_nudge">
+		<input type="hidden" name="booking" value="<?php echo (int) $booking_id; ?>">
+		<input type="hidden" name="back" value="<?php echo esc_attr( pn_cr_self_url() ); ?>">
+		<?php wp_nonce_field( 'pn_vc_nudge_' . $booking_id ); ?>
+		<button type="submit" class="button button-small" title="<?php echo esc_attr( $title ); ?>">
+			<?php echo esc_html( $label ); ?>
+		</button>
+	</form>
+	<?php
+	echo pn_cr_nudge_note( $booking_id, $phase );  // phpcs:ignore WordPress.Security.EscapeOutput -- escaped inside.
+}
+
+/* ===================================================================
  * 4. Screens
  * =================================================================== */
 
@@ -621,7 +764,12 @@ function pn_cr_render_list() {
 				<td class="pn-cr-num"><?php echo (int) $total; ?></td>
 				<td><?php echo esc_html( pn_cr_fmt_day( $c['first'] ) ?: '—' ); ?></td>
 				<td><?php echo esc_html( pn_cr_fmt_day( $c['last'] ) ?: '—' ); ?></td>
-				<td><?php
+				<td><div class="pn-cr-photocell"><?php
+					// The button first: a row that reads "0 of 1" is a row the owner wants to act on, and
+					// making him open the customer to do it is the step this saves. It targets the rental
+					// still in play (pn_cr_customer), so a customer with history nudges the current rental.
+					pn_cr_render_nudge( $c['pending'], $c['pending_phase'] );
+
 					// Neutral until it is actually complete: every row reading red is noise, not a signal.
 					$cls = ( $total && $done === $total ) ? 'is-ok' : ( $done ? 'is-part' : 'is-none' );
 					printf(
@@ -630,7 +778,7 @@ function pn_cr_render_list() {
 						$total ? (int) round( 100 * $done / $total ) : 0,
 						$done, $total
 					);
-				?></td>
+				?></div></td>
 				<td class="pn-cr-num pn-cr-money"><?php echo esc_html( '$' . number_format( $c['spend'], 2 ) ); ?></td>
 			</tr>
 		<?php endforeach; ?>
@@ -831,7 +979,12 @@ function pn_cr_render_rental( $booking_id ) {
 
 		<section class="pn-cr-sec">
 			<h3>Condition photos <span>the before/after pair</span></h3>
-			<?php foreach ( array( 'pickup' => 'At pickup', 'return' => 'At return' ) as $phase => $label ) :
+			<?php
+			// The button belongs to the CURRENT phase only. Offered against "At return" while pickup is
+			// still open it would lie about what it sends: the endpoint derives the phase from the locks
+			// and would mail the pickup link.
+			$current = pn_cr_photo_phase( $booking_id );
+			foreach ( array( 'pickup' => 'At pickup', 'return' => 'At return' ) as $phase => $label ) :
 				$at    = pn_cr_meta( $booking_id, '_pn_vc_' . $phase . '_done_at' );
 				$shots = array();
 				foreach ( pn_cr_slots() as $slot => $slot_label ) {
@@ -839,7 +992,10 @@ function pn_cr_render_rental( $booking_id ) {
 				}
 				?>
 				<div class="pn-cr-phase">
-					<p class="pn-cr-phase-head">
+					<!-- A div, not a <p>: this line now holds the send button, and an HTML parser closes an
+					     open <p> the moment it meets a <form> — the button would render outside the row and
+					     the flex layout with it. It is display:flex either way, so nothing else changes. -->
+					<div class="pn-cr-phase-head">
 						<strong><?php echo esc_html( $label ); ?></strong>
 						<?php echo $at
 							? '<span class="pn-cr-ok">&#10003; locked ' . esc_html( pn_cr_fmt( $at ) ) . '</span>'
@@ -847,7 +1003,8 @@ function pn_cr_render_rental( $booking_id ) {
 						<?php if ( $shots ) : ?>
 							<span class="pn-cr-muted"><?php printf( '%d of %d photos', count( $shots ), count( pn_cr_slots() ) ); ?></span>
 						<?php endif; ?>
-					</p>
+						<?php if ( $phase === $current ) { pn_cr_render_nudge( $booking_id, $phase ); } ?>
+					</div>
 					<?php if ( $shots ) : ?>
 						<div class="pn-cr-thumbs">
 							<?php foreach ( $shots as $slot_label => $att ) {
@@ -948,6 +1105,12 @@ function pn_cr_styles() {
 		.pn-cr-email { display: block; }
 		.pn-cr-phone { display: block; font-size: 12px; color: #646970; font-variant-numeric: tabular-nums; }
 		.pn-cr-unassigned td { background: #fcf9e8; }
+
+		/* The photos cell holds a button, a status line and the bar: one flex row that wraps on a
+		   narrow screen rather than stretching the column. */
+		.pn-cr-photocell { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+		.pn-cr-nudge { margin: 0; display: inline-flex; }
+		.pn-cr-photocell .pn-cr-ok, .pn-cr-photocell .pn-cr-todo { font-size: 12px; }
 
 		/* Completeness: neutral when it is simply not done yet. Every row in red is noise, not signal. */
 		.pn-cr-pairs { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: #50575e; }

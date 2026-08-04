@@ -36,7 +36,16 @@ function esc_attr( $v ) { return $v; }
 function esc_url( $v ) { return $v; }
 function esc_html__( $v ) { return $v; }
 function admin_url( $p = '' ) { return 'https://example.test/wp-admin/' . $p; }
-function add_query_arg( $args, $url = '' ) { return $url . '?' . http_build_query( $args ); }
+/**
+ * WP's add_query_arg does NOT urlencode values — build_query() passes $urlencode = false — which is
+ * exactly why pn_cr_self_url() rawurlencodes its own. An http_build_query() stub would encode for it
+ * and hide that, so this one is deliberately as blunt as the real thing.
+ */
+function add_query_arg( $args, $url = '' ) {
+	$qs = array();
+	foreach ( (array) $args as $k => $v ) { $qs[] = $k . '=' . $v; }
+	return $url . '?' . implode( '&', $qs );
+}
 function get_post( $id ) { return isset( $GLOBALS['pn_meta'][ $id ] ) ? (object) array( 'ID' => $id ) : null; }
 function get_post_meta( $id, $key, $single = false ) { return $GLOBALS['pn_meta'][ $id ][ $key ] ?? ''; }
 function get_post_stati() {
@@ -132,6 +141,63 @@ is_( $mike['id'], md5( 'mike@example.com' ), 'detail links key on a hash, so no 
 
 $unassigned = pn_cr_customer( '__unassigned', array( 14 ) );
 is_( $unassigned['email'], '', 'the Unassigned bucket has no email to show' );
+
+/* ---------- 1b. chasing the missing photos (v1.3.0) ----------
+ * The button is a POST to another plugin's endpoint, so what is worth asserting here is the only
+ * decision this file makes about it: WHICH rental it points at, and whether it tells the truth about
+ * the last attempt. Both fail quietly — a button on the wrong rental mails the wrong customer, and a
+ * green "link sent" over an undelivered message stops the owner chasing.
+ */
+
+is_( pn_cr_photo_phase( 13 ), 'pickup', 'no locks at all -> the pickup set is what is missing' );
+is_( pn_cr_photo_phase( 12 ), 'return', 'pickup locked -> the return set is next' );
+is_( pn_cr_photo_phase( 11 ), 'done', 'both locked -> nothing to chase' );
+
+is_( $mike['pending'], 12, 'the row button skips the rental whose pair is complete' );
+is_( $mike['pending_phase'], 'return', 'and asks for the phase that rental is actually missing' );
+is_( pn_cr_customer( 'x', array( 11 ) )['pending'], 0, 'a customer with nothing open offers no button' );
+is_( pn_cr_customer( 'x', array( 11 ) )['pending_phase'], '', 'and no phase to send' );
+// Two rentals still open: the one in play is the LATEST pickup, not whichever the query read first.
+is_( pn_cr_customer( 'x', array( 12, 13 ) )['pending'], 13, 'with two open rentals it chases the later pickup' );
+is_( pn_cr_customer( 'x', array( 13, 12 ) )['pending'], 13, 'whatever order they arrive in' );
+// An undated booking must not out-rank a dated one just by being read last. Meta only, never added to
+// $pn_bookings — the fixture set the later sections count is not this one's to change.
+$GLOBALS['pn_meta'][15] = array( 'mpbc_customer_email' => 'later@example.com' );
+is_( pn_cr_customer( 'x', array( 13, 15 ) )['pending'], 13, 'a dated open rental beats an undated one' );
+is_( pn_cr_customer( 'x', array( 15, 13 ) )['pending'], 13, 'in either order' );
+
+is_( pn_cr_nudge_note( 12, 'return' ), '', 'a rental nobody has chased says nothing' );
+$GLOBALS['pn_meta'][12]['_pn_vc_nudged_return_at'] = '2026-05-03 15:00:00';
+$GLOBALS['pn_meta'][12]['_pn_vc_nudged_return_r']  = 'sent';
+is_( false !== strpos( pn_cr_nudge_note( 12, 'return' ), 'link sent' ), true, 'a real send says so' );
+is_( false !== strpos( pn_cr_nudge_note( 12, 'return' ), 'pn-cr-ok' ), true, 'and reads green' );
+is_( pn_cr_nudge_note( 12, 'pickup' ), '',
+	'the note is read for ONE phase — a return send must not claim the pickup link went out' );
+// THE HONESTY CASE. wp_mail() returns true on this host with no SMTP, and the sending plugin records
+// `nosmtp` for exactly that. Painting it as sent is the worst failure in the feature.
+$GLOBALS['pn_meta'][12]['_pn_vc_nudged_return_r'] = 'nosmtp';
+$note = pn_cr_nudge_note( 12, 'return' );
+is_( false !== strpos( $note, 'pn-cr-todo' ), true, 'an accepted-but-undelivered send reads red' );
+is_( strpos( $note, 'link sent' ), false, 'and is never worded as sent' );
+is_( false !== strpos( $note, 'no SMTP' ), true, 'and names the reason, so it is fixable' );
+$GLOBALS['pn_meta'][12]['_pn_vc_nudged_return_r'] = 'sent';
+
+// The label is the only place a phase is put in front of the owner on this screen.
+is_( pn_cr_nudge_label( 'pickup' ), 'Send pickup photo link', 'pickup phase offers the pickup link' );
+is_( pn_cr_nudge_label( 'return' ), 'Send return photo link', 'return phase offers the return link' );
+is_( pn_cr_nudge_label( 'done' ), '', 'and a finished rental offers no button at all' );
+
+/* The `back` URL is echoed into the page and then handed to a redirect, so it is rebuilt from
+ * sanitized params. add_query_arg() does NOT encode values, and wp_sanitize_redirect() deletes the
+ * space that leaves behind — the bug that brought a two-word search back matching nothing. */
+$_GET = array( 'page' => 'pn-customer-records', 's' => 'mike ortiz', 'customer' => md5( 'mike@example.com' ), 'junk' => 'x' );
+$self = pn_cr_self_url();
+is_( false !== strpos( $self, 's=mike%20ortiz' ), true, 'a two-word search survives the round trip encoded' );
+is_( false !== strpos( $self, 'customer=' . md5( 'mike@example.com' ) ), true, 'and it returns to the same customer' );
+is_( strpos( $self, 'junk' ), false, 'only the screen’s own params ride along' );
+$_GET = array( 'page' => 'pn-customer-records', 's' => array( 'x' ) );
+is_( strpos( pn_cr_self_url(), 's=' ), false, 'an array-valued param is dropped, not concatenated' );
+$_GET = array();
 
 /* ---------- 2. search (§9.4) ---------- */
 
